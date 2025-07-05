@@ -1,7 +1,6 @@
 <div id="sidebar-collapse" class="col-sm-3 col-lg-2 sidebar">
 		<ul class="nav menu">
 			<li><a href="<?= base_url('admin/dashboard-admin');?>"><span class="glyphicon glyphicon-dashboard"></span> Dashboard</a></li>
-			<li><a href="index.html"><span class="glyphicon glyphicon-dashboard"></span> Dashboard</a></li>
 			<li class="parent ">
 				<a href="#">
 					<span class="glyphicon glyphicon-list"></span> Master Data <span data-toggle="collapse" href="#sub-item-master" class="icon pull-right"><em class="glyphicon glyphicon-s glyphicon-plus"></em></span> 
@@ -32,6 +31,18 @@
 							<span class="glyphicon glyphicon-share-alt"></span> Data Buku
 						</a>
 					</li>
+				</ul>
+					<li class="parent">
+					<a href="#">
+						<span class="glyphicon glyphicon-retweet"></span> Transaksi <span data-toggle="collapse" href="#sub-item-transaksi" class="icon pull-right"><em class="glyphicon glyphicon-s glyphicon-plus"></em></span>
+					</a>
+					<ul class="children collapse" id="sub-item-transaksi">
+						<li>
+							<a href="<?= base_url('admin/peminjaman-step-1'); ?>">
+								<span class="glyphicon glyphicon-share-alt"></span> Peminjaman</a>
+						</li>
+					</ul>
+		</li>
 				</ul>
 			</li>
 			<li role="presentation" class="divider"></li>
