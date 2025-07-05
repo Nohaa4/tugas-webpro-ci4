@@ -3,9 +3,25 @@
 namespace App\Controllers;
 //load models
 use App\Models\M_Admin;
+use App\Models\M_Anggota;
 use App\Models\M_Buku;     
 use App\Models\M_Kategori; 
-use App\Models\M_Rak;      
+use App\Models\M_Rak;    
+use App\Models\M_Peminjaman;  
+use Endroid\QrCode\Builder\Builder;
+use Endroid\QrCode\Encoding\Encoding;
+use Endroid\QrCode\ErrorCorrectionLevel;
+use Endroid\QrCode\Label\LabelAlignment;
+use Endroid\QrCode\Label\Font\Font;
+use Endroid\QrCode\RoundBlockSizeMode;
+use Endroid\QrCode\Writer\PngWriter;
+use Endroid\QrCode\Color\Color;
+use Endroid\QrCode\QrCode;
+use Endroid\QrCode\Logo\Logo;
+use Endroid\QrCode\Label\Label;
+
+$writer = new PngWriter();
+
 
 class Admin extends BaseController
 {
@@ -548,7 +564,388 @@ public function edit_buku($id_buku_hashed = null)
         // Redirect ke halaman master buku
         return redirect()->to(base_url('admin/master-buku'));
     }
-// Akhir Modul Buku
+    // Akhir Modul Buku
 
+   public function peminjaman_step1()
+    {
+        if (session()->get('ses_id') == "" || session()->get('ses_user') == "" || session()->get('ses_level') == "") {
+            session()->setFlashdata('error', 'Silakan login terlebih dahulu!');
+            return redirect()->to(base_url('admin/login-admin'));
+        }
+
+        // Hapus session idAnggota jika ada dari transaksi sebelumnya
+        session()->remove('idAnggotaPeminjaman'); // Menggunakan nama session yang lebih spesifik
+
+        $uri = service('uri');
+        $data = [
+            'page' => $uri->getSegment(2) ?: 'peminjaman-step-1',
+            'web_title' => "Transaksi Peminjaman - Langkah 1",
+        ];
+
+        echo view('Backend/Template/header', $data);
+        echo view('Backend/Template/sidebar', $data);
+        echo view('Backend/Transaksi/peminjaman_step1', $data); // View ini berisi form input id_anggota
+        echo view('Backend/Template/footer', $data);
+    }
+
+    // Pertemuan VII - Langkah 2: Tampilkan detail anggota, buku, dan keranjang
+    // (Gabungan logika dari OCR halaman 69-72)
+    public function peminjaman_step2()
+    {
+        if (session()->get('ses_id') == "" || session()->get('ses_user') == "" || session()->get('ses_level') == "") {
+            session()->setFlashdata('error', 'Silakan login terlebih dahulu!');
+            return redirect()->to(base_url('admin/login-admin'));
+        }
+
+        $modelAnggota = new M_Anggota();
+        $modelBuku = new M_Buku();
+        $modelPeminjaman = new M_Peminjaman();
+        $uri = service('uri');
+
+        $idAnggota = null;
+        if ($this->request->getPost('id_anggota')) {
+            $idAnggota = $this->request->getPost('id_anggota');
+            session()->set('idAnggotaPeminjaman', $idAnggota);
+        } else {
+            $idAnggota = session()->get('idAnggotaPeminjaman');
+        }
+
+        if (!$idAnggota) {
+            session()->setFlashdata('error', 'ID Anggota belum diinput. Silakan mulai dari Langkah 1.');
+            return redirect()->to(base_url('admin/peminjaman-step1'));
+        }
+
+        $dataAnggota = $modelAnggota->getDataAnggota(['id_anggota' => $idAnggota, 'is_delete_anggota' => '0'])->getRowArray();
+        if (!$dataAnggota) {
+            session()->remove('idAnggotaPeminjaman');
+            session()->setFlashdata('error', 'ID Anggota tidak ditemukan atau tidak aktif. Silakan coba lagi.');
+            return redirect()->to(base_url('admin/peminjaman-step1'));
+        }
+
+        // Cek apakah anggota masih punya transaksi berjalan
+        $cekPeminjamanAktif = $modelPeminjaman->getDataPeminjaman([
+            'id_anggota' => $idAnggota,
+            'status_transaksi' => 'Berjalan'
+        ])->getNumRows();
+
+        if ($cekPeminjamanAktif > 0) {
+            session()->remove('idAnggotaPeminjaman');
+            session()->setFlashdata('error', 'Anggota ini masih memiliki transaksi peminjaman yang belum diselesaikan!');
+            return redirect()->to(base_url('admin/peminjaman-step1'));
+        }
+
+        $dataBukuTersedia = $modelBuku->getDataBukuJoin([
+            'tbl_buku.is_delete_buku' => '0',
+            'tbl_buku.jumlah_eksemplar >' => 0
+        ])->getResultArray();
+
+        $keranjangPeminjaman = $modelPeminjaman->getDataTempJoin([
+            'tbl_temp_peminjaman.id_anggota' => $idAnggota
+        ])->getResultArray();
+        
+        $jumlahItemDiKeranjang = count($keranjangPeminjaman);
+
+        $data = [
+            'page' => $uri->getSegment(2) ?: 'peminjaman-step-2',
+            'web_title' => 'Transaksi Peminjaman - Langkah 2',
+            'anggota' => $dataAnggota,
+            'buku_tersedia' => $dataBukuTersedia, // Daftar semua buku yang bisa dipinjam
+            'keranjang' => $keranjangPeminjaman, // Daftar buku di tabel temp
+            'jumlah_item_keranjang' => $jumlahItemDiKeranjang
+        ];
+
+        echo view('Backend/Template/header', $data);
+        echo view('Backend/Template/sidebar', $data);
+        echo view('Backend/Transaksi/peminjaman_step2', $data); // View ini menampilkan detail & daftar buku
+        echo view('Backend/Template/footer', $data);
+    }
+
+    // Pertemuan VII - Proses simpan buku ke tabel temp peminjaman
+    // (Sesuai OCR halaman 73, route GET /admin/simpan-temp-pinjam/(:alphanum))
+    public function simpan_temp_pinjam($idBukuHashed = null)
+    {
+        if (session()->get('ses_id') == "" || session()->get('ses_user') == "" || session()->get('ses_level') == "") {
+            session()->setFlashdata('error', 'Silakan login terlebih dahulu!');
+            return redirect()->to(base_url('admin/login-admin'));
+        }
+
+        $modelPeminjaman = new M_Peminjaman();
+        $modelBuku = new M_Buku();
+        
+        $idAnggota = session()->get('idAnggotaPeminjaman');
+
+        if (!$idAnggota) {
+             session()->setFlashdata('error', 'Sesi anggota tidak valid. Silakan ulangi dari Langkah 1.');
+             return redirect()->to(base_url('admin/peminjaman-step-1'));
+        }
+        if ($idBukuHashed == null) {
+            session()->setFlashdata('error', 'ID Buku tidak valid.');
+            return redirect()->to(base_url('admin/peminjaman-step-2'));
+        }
+
+        $dataBuku = $modelBuku->getDataBuku(['sha1(id_buku)' => $idBukuHashed, 'is_delete_buku' => '0'])->getRowArray();
+        if (!$dataBuku) {
+            session()->setFlashdata('error', 'Buku tidak ditemukan atau sudah dihapus.');
+            return redirect()->to(base_url('admin/peminjaman-step-2'));
+        }
+        if ($dataBuku['jumlah_eksemplar'] < 1) {
+            session()->setFlashdata('error', 'Stok buku "' . $dataBuku['judul_buku'] . '" habis.');
+            return redirect()->to(base_url('admin/peminjaman-step-2'));
+        }
+        
+        $idBukuAsli = $dataBuku['id_buku'];
+
+        // Cek apakah buku sudah ada di temp untuk anggota ini
+        $adaDiTemp = $modelPeminjaman->getDataTemp([
+            'id_buku' => $idBukuAsli,
+            'id_anggota' => $idAnggota
+        ])->getNumRows();
+
+        if ($adaDiTemp > 0) {
+            session()->setFlashdata('warning', 'Buku "' . $dataBuku['judul_buku'] . '" sudah ada di keranjang Anda.');
+            return redirect()->to(base_url('admin/peminjaman-step-2'));
+        }
+        
+        // Cek lagi peminjaman aktif, sebagai double check
+        $adaPinjamAktif = $modelPeminjaman->getDataPeminjaman([
+            'id_anggota' => $idAnggota,
+            'status_transaksi' => 'Berjalan'
+        ])->getNumRows();
+        if($adaPinjamAktif > 0){
+            session()->setFlashdata('error', 'Masih ada transaksi peminjaman yang belum diselesaikan!');
+            return redirect()->to(base_url('admin/peminjaman-step1'));
+        }
+
+        // Simpan ke temp
+        $dataTemp = [
+            'id_anggota' => $idAnggota,
+            'id_buku' => $idBukuAsli,
+            // 'tgl_temp' => date('Y-m-d H:i:s'), // M_Peminjaman mungkin punya default created_at
+            'jumlah_temp' => 1 // Asumsi selalu 1 per penambahan
+        ];
+        $modelPeminjaman->saveDataTemp($dataTemp); // Asumsi method ini adalah insert ke tbl_temp_peminjaman
+
+        // Kurangi stok buku
+        $stokBaru = $dataBuku['jumlah_eksemplar'] - 1;
+        $modelBuku->updateDataBuku(['jumlah_eksemplar' => $stokBaru], ['id_buku' => $idBukuAsli]);
+
+        session()->setFlashdata('success', 'Buku "' . $dataBuku['judul_buku'] . '" berhasil ditambahkan ke keranjang.');
+        return redirect()->to(base_url('admin/peminjaman-step-2'));
+    }
+
+    // Pertemuan VII - Proses hapus buku dari tabel temp peminjaman dan kembalikan stok
+    // (Sesuai OCR halaman 74, route GET /admin/hapus-temp/(:alphanum), di OCR disebut hapus_peminjaman)
+    // Saya akan menggunakan nama hapus_temp_item untuk lebih jelas
+    public function hapus_temp_item($idBukuHashed = null)
+    {
+        if (session()->get('ses_id') == "" || session()->get('ses_user') == "" || session()->get('ses_level') == "") {
+            session()->setFlashdata('error', 'Silakan login terlebih dahulu!');
+            return redirect()->to(base_url('admin/login-admin'));
+        }
+
+        $modelPeminjaman = new M_Peminjaman();
+        $modelBuku = new M_Buku();
+        $idAnggota = session()->get('idAnggotaPeminjaman');
+
+        if (!$idAnggota) {
+             session()->setFlashdata('error', 'Sesi anggota tidak valid.');
+             return redirect()->to(base_url('admin/peminjaman-step1'));
+        }
+        if ($idBukuHashed == null) {
+            session()->setFlashdata('error', 'ID Buku tidak valid untuk dihapus.');
+            return redirect()->to(base_url('admin/peminjaman-step-2'));
+        }
+
+        $dataBuku = $modelBuku->getDataBuku(['sha1(id_buku)' => $idBukuHashed])->getRowArray();
+        if (!$dataBuku) {
+            session()->setFlashdata('error', 'Data buku yang akan dihapus dari keranjang tidak ditemukan!');
+            return redirect()->to(base_url('admin/peminjaman-step-2'));
+        }
+        $idBukuAsli = $dataBuku['id_buku'];
+
+        // Hapus dari temp
+        $modelPeminjaman->hapusDataTemp([
+            'id_buku' => $idBukuAsli, // Hapus berdasarkan ID asli
+            'id_anggota' => $idAnggota
+        ]);
+
+        // Kembalikan stok buku
+        $stokBaru = $dataBuku['jumlah_eksemplar'] + 1;
+        $modelBuku->updateDataBuku(['jumlah_eksemplar' => $stokBaru], ['id_buku' => $idBukuAsli]);
+
+        session()->setFlashdata('info', 'Buku "' . $dataBuku['judul_buku'] . '" telah dihapus dari keranjang.');
+        return redirect()->to(base_url('admin/peminjaman-step-2'));
+    }
+
+    public function simpan_transaksi_peminjaman()
+    {
+        $modelPeminjaman = new M_Peminjaman();
+        $idPeminjaman = date("ymdhis");
+        $time_sekarang = time();
+        $tgl_kembali = date("Y-m-d", strtotime("+7 days", $time_sekarang));
+        $idAnggota = session()->get('idAnggotaPeminjaman');
+        $itemDiKeranjang = $modelPeminjaman->getDataTemp(['id_anggota' => $idAnggota])->getResultArray();
+        $jumlahPinjam = count($itemDiKeranjang);
+
+        // QR Code config
+        $dataQR = $idPeminjaman;
+        $labelQR = "No: " . $idPeminjaman;
+        $logoPath = FCPATH . 'Assets/logo_ubsi.png';
+        $qrPathDir = FCPATH . 'Assets/qr_code/';
+        if (!is_dir($qrPathDir)) {
+            mkdir($qrPathDir, 0775, true);
+        }
+        $namaQR = "qr_" . $idPeminjaman . ".png";
+
+        // QR Code generation (tanpa builder, langsung pakai QrCode)
+        $qrCode = new QrCode(
+            data: $dataQR,
+            encoding: new Encoding('UTF-8'),
+            errorCorrectionLevel: ErrorCorrectionLevel::Low,
+            size: 300,
+            margin: 10,
+            roundBlockSizeMode: RoundBlockSizeMode::Margin,
+            foregroundColor: new Color(0, 0, 0),
+            backgroundColor: new Color(255, 255, 255)
+        );
+        $logo = null;
+        if (file_exists($logoPath)) {
+            $logo = new Logo(
+                path: $logoPath,
+                resizeToWidth: 50,
+                punchoutBackground: true
+            );
+        }
+        $fontPath = FCPATH . 'Assets/fonts/glyphicons-halflings-regular.ttf';
+        $font = new Font($fontPath, 16);
+        $label = new Label(
+            text: $labelQR,
+            font: $font,
+            textColor: new Color(255, 0, 0)
+        );
+        $writer = new PngWriter();
+        $result = $writer->write($qrCode, $logo, $label);
+        $result->saveToFile($qrPathDir . $namaQR);
+
+        // Simpan ke tabel peminjaman utama (tbl_peminjaman)
+        $dataPeminjamanUtama = [
+            'no_peminjaman' => $idPeminjaman,
+            'id_anggota' => $idAnggota,
+            'tgl_pinjam' => date('Y-m-d'),
+            'total_pinjam' => $jumlahPinjam,
+            'id_admin' => session()->get('ses_id'),
+            'status_transaksi' => 'Berjalan',
+            'status_ambil_buku' => 'Sudah Diambil',
+            'qr_code' => $namaQR
+        ];
+        $modelPeminjaman->saveDataPeminjaman($dataPeminjamanUtama);
+
+        // Simpan ke tabel detail peminjaman (tbl_detail_peminjaman)
+        $detailPeminjamanBatch = [];
+        foreach ($itemDiKeranjang as $item) {
+            $detailPeminjamanBatch[] = [
+                'no_peminjaman' => $idPeminjaman,
+                'id_buku' => $item['id_buku'],
+                'status_peminjaman' => 'Sedang Dipinjam',
+                'tgl_kembali' => $tgl_kembali,
+            ];
+        }
+        if (!empty($detailPeminjamanBatch)) {
+            $modelPeminjaman->saveDataDetail($detailPeminjamanBatch);
+        }
+
+        // Hapus data dari tabel temp
+        $modelPeminjaman->hapusDataTemp(['id_anggota' => $idAnggota]);
+        session()->remove('idAnggotaPeminjaman');
+        session()->setFlashdata('success', 'Transaksi peminjaman buku No. ' . $idPeminjaman . ' berhasil disimpan!');
+        return redirect()->to(base_url('admin/data-transaksi-peminjaman')); // (Sesuai OCR hal 76)
+    }
+
+    // Untuk menampilkan data transaksi yang sudah ada
+    // (Mirip dengan yang sudah ada di kode Anda, disesuaikan sedikit untuk konteks)
+    public function data_transaksi_peminjaman()
+    {
+        if (session()->get('ses_id') == "" || session()->get('ses_user') == "" || session()->get('ses_level') == "") {
+            session()->setFlashdata('error', 'Silakan login terlebih dahulu!');
+            return redirect()->to(base_url('admin/login-admin'));
+        }
+        $modelPeminjaman = new M_Peminjaman();
+        $modelBuku = new M_Buku(); // Untuk mengambil judul buku
+
+        $dataPeminjamanUtama = $modelPeminjaman->getDataPeminjamanJoin()->getResultArray(); // Join dengan anggota & admin
+        
+        $dataTransaksiLengkap = [];
+        foreach ($dataPeminjamanUtama as $transaksi) {
+            $detailBuku = $modelPeminjaman->getDataDetail(['no_peminjaman' => $transaksi['no_peminjaman']])->getResultArray();
+            $judulBukuDipinjam = [];
+            foreach ($detailBuku as $detail) {
+                $bukuInfo = $modelBuku->getDataBuku(['id_buku' => $detail['id_buku']])->getRowArray();
+                if ($bukuInfo) {
+                    $judulBukuDipinjam[] = $bukuInfo['judul_buku'];
+                }
+            }
+            $transaksi['daftar_judul_buku'] = implode(', ', $judulBukuDipinjam);
+            $dataTransaksiLengkap[] = $transaksi;
+        }
+
+        $uri = service('uri');
+        $data = [
+            'page' => $uri->getSegment(2) ?: 'data-transaksi-peminjaman',
+            'web_title' => "Data Transaksi Peminjaman",
+            'data_peminjaman' => $dataTransaksiLengkap
+        ];
+
+        echo view('Backend/Template/header', $data);
+        echo view('Backend/Template/sidebar', $data);
+        echo view('Backend/Transaksi/data-peminjaman', $data); // View untuk menampilkan daftar transaksi
+        echo view('Backend/Template/footer', $data);
+    }
+    public function detail_transaksi_peminjaman($no_peminjaman = null)
+    {
+        if (session()->get('ses_id') == "" || session()->get('ses_user') == "" || session()->get('ses_level') == "") {
+            session()->setFlashdata('error', 'Silakan login terlebih dahulu!');
+            return redirect()->to(base_url('admin/login-admin'));
+        }
+
+        if ($no_peminjaman === null) {
+            session()->setFlashdata('error', 'Nomor peminjaman tidak valid.');
+            return redirect()->to(base_url('admin/data-transaksi-peminjaman'));
+        }
+
+        $modelPeminjaman = new M_Peminjaman();
+        $modelBuku = new M_Buku();
+
+        // Ambil data peminjaman utama (join dengan anggota dan admin)
+        $transaksi = $modelPeminjaman->getDataPeminjamanJoin(['tbl_peminjaman.no_peminjaman' => $no_peminjaman])->getRowArray();
+
+        if (!$transaksi) {
+            session()->setFlashdata('error', 'Data transaksi peminjaman tidak ditemukan.');
+            return redirect()->to(base_url('admin/data-transaksi-peminjaman'));
+        }
+
+        // Ambil detail buku yang dipinjam
+        $detailItems = $modelPeminjaman->getDataDetail(['no_peminjaman' => $no_peminjaman])->getResultArray();
+        $bukuDipinjam = [];
+        foreach ($detailItems as $item) {
+            $bukuInfo = $modelBuku->getDataBuku(['id_buku' => $item['id_buku']])->getRowArray();
+            if ($bukuInfo) {
+                $item['judul_buku'] = $bukuInfo['judul_buku'];
+                $item['pengarang'] = $bukuInfo['pengarang'];
+                // Tambahkan info lain jika perlu
+            }
+            $bukuDipinjam[] = $item;
+        }
+        $transaksi['detail_buku'] = $bukuDipinjam;
+
+        $data = [
+            'page' => 'detail-transaksi-peminjaman',
+            'web_title' => "Detail Transaksi Peminjaman - " . $no_peminjaman,
+            'transaksi' => $transaksi
+        ];
+
+        echo view('Backend/Template/header', $data);
+        echo view('Backend/Template/sidebar', $data);
+        echo view('Backend/Transaksi/detail-transaksi-peminjaman', $data); // View baru untuk detail
+        echo view('Backend/Template/footer', $data);
+    }
 }
-
